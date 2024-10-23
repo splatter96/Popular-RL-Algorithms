@@ -40,6 +40,24 @@ parser.add_argument("--test", dest="test", action="store_true", default=False)
 args = parser.parse_args()
 
 
+class POMDP_wrapper(gym.ObservationWrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        # high = np.array(
+        #     [
+        #         4.8,
+        #         0.42,
+        #     ],
+        #     dtype=np.float32,
+        # )
+        # self._observation_space = gym.spaces.Box(low=-high, high=high, dtype=np.float32)
+        #
+
+    def observation(self, observation):
+        observation[[1, 3]] = 0.0
+        return observation
+
+
 class ReplayBuffer:
     def __init__(self, capacity):
         self.capacity = capacity
@@ -494,6 +512,9 @@ replay_buffer = ReplayBuffer(replay_buffer_size)
 
 # choose env
 env = gym.make("CartPole-v1")
+
+# Remove velocity
+env = POMDP_wrapper(env)
 
 state_dim = env.observation_space.shape[0]
 action_dim = env.action_space.n  # discrete
