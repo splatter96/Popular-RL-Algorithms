@@ -19,6 +19,8 @@ from torch.distributions import Categorical
 from IPython.display import clear_output
 import matplotlib.pyplot as plt
 import argparse
+from common.buffers import *
+from foldedtensor import as_folded_tensor
 
 GPU = True
 device_idx = 0
@@ -38,6 +40,82 @@ parser.add_argument("--train", dest="train", action="store_true", default=False)
 parser.add_argument("--test", dest="test", action="store_true", default=False)
 
 args = parser.parse_args()
+
+
+def ints_to_tensor(ints):
+    """
+    Converts a nested list of integers to a padded tensor.
+    """
+    if isinstance(ints, torch.Tensor):
+        return ints
+    if isinstance(ints, list):
+        if isinstance(ints[0], (int, bool)):
+            return torch.LongTensor(ints)
+        if isinstance(ints[0], torch.Tensor):
+            return pad_tensors(ints)
+        if isinstance(ints[0], list):
+            return ints_to_tensor([ints_to_tensor(inti) for inti in ints])
+
+
+def floats_to_tensor(floats, pad_value=0):
+    """
+    Converts a nested list of floats to a padded tensor.
+    """
+    if isinstance(floats, torch.Tensor):
+        return floats
+    if isinstance(floats, list):
+        if isinstance(floats[0], (float, np.ndarray, bool)):
+            return torch.FloatTensor(floats)
+        if isinstance(floats[0], torch.Tensor):
+            return pad_tensors(floats, pad_value)
+        if isinstance(floats[0], list):
+            return floats_to_tensor(
+                [floats_to_tensor(floati, pad_value) for floati in floats], pad_value
+            )
+
+
+def bools_to_tensor(bools):
+    """
+    Converts a nested list of bools to a padded tensor.
+    """
+    if isinstance(bools, torch.Tensor):
+        return bools
+    if isinstance(bools, list):
+        print(type(bools[0]))
+        if isinstance(bools[0], (bool, np.ndarray)):
+            return torch.BoolTensor(bools)
+        if isinstance(bools[0], torch.Tensor):
+            return pad_tensors(bools)
+        if isinstance(bools[0], list):
+            return bools_to_tensor([bools_to_tensor(booli) for booli in bools])
+
+
+def pad_tensors(tensors, pad_value=1):
+    """
+    Takes a list of `N` M-dimensional tensors (M<4) and returns a padded tensor.
+
+    The padded tensor is `M+1` dimensional with size `N, S1, S2, ..., SM`
+    where `Si` is the maximum value of dimension `i` amongst all tensors.
+    """
+    rep = tensors[0]
+    padded_dim = []
+    for dim in range(rep.dim()):
+        max_dim = max([tensor.size(dim) for tensor in tensors])
+        padded_dim.append(max_dim)
+    padded_dim = [len(tensors)] + padded_dim
+    padded_tensor = torch.ones(padded_dim) * pad_value
+    padded_tensor = padded_tensor.type_as(rep)
+    for i, tensor in enumerate(tensors):
+        size = list(tensor.size())
+        if len(size) == 1:
+            padded_tensor[i, : size[0]] = tensor
+        elif len(size) == 2:
+            padded_tensor[i, : size[0], : size[1]] = tensor
+        elif len(size) == 3:
+            padded_tensor[i, : size[0], : size[1], : size[2]] = tensor
+        else:
+            raise ValueError("Padding is supported for upto 3D tensors at max.")
+    return padded_tensor
 
 
 class ReplayBuffer:
@@ -87,6 +165,35 @@ class SoftQNetwork(nn.Module):
         # x = F.tanh(self.linear3(x))
         x = self.linear4(x)
         return x
+
+
+class SoftQNetworkLSTM(nn.Module):
+    def __init__(self, num_inputs, num_actions, hidden_size, init_w=3e-3):
+        super(SoftQNetworkLSTM, self).__init__()
+
+        self.linear1 = nn.Linear(num_inputs, hidden_size)
+        self.linear2 = nn.Linear(hidden_size, hidden_size)
+        self.lstm1 = nn.LSTM(hidden_size, hidden_size)
+        self.linear4 = nn.Linear(hidden_size, num_actions)
+
+        self.linear4.weight.data.uniform_(-init_w, init_w)
+        self.linear4.bias.data.uniform_(-init_w, init_w)
+
+    def forward(self, state, hidden_in):
+        """
+        state shape: (batch_size, sequence_length, state_dim)
+        output shape: (batch_size, sequence_length, 1)
+        for lstm needs to be permuted as: (sequence_length, batch_size, state_dim)
+        """
+        state = state.permute(1, 0, 2)
+
+        x = F.tanh(self.linear1(state))
+        x, lstm_hidden = self.lstm1(x, hidden_in)  # no activation after lstm
+        x = F.tanh(self.linear2(x))
+        # x = F.tanh(self.linear3(x))
+        x = self.linear4(x)
+        x = x.permute(1, 0, 2)
+        return x, lstm_hidden
 
 
 class PolicyNetwork(nn.Module):
@@ -145,19 +252,94 @@ class PolicyNetwork(nn.Module):
         return action
 
 
+class PolicyNetworkLSTM(nn.Module):
+    def __init__(
+        self,
+        num_inputs,
+        num_actions,
+        hidden_size,
+        init_w=3e-3,
+        log_std_min=-20,
+        log_std_max=2,
+    ):
+        super(PolicyNetworkLSTM, self).__init__()
+
+        self.linear1 = nn.Linear(num_inputs, hidden_size)
+        self.linear2 = nn.Linear(hidden_size, hidden_size)
+        self.linear3 = nn.Linear(hidden_size, hidden_size)
+        # self.linear4 = nn.Linear(hidden_size, hidden_size)
+
+        self.lstm1 = nn.LSTM(hidden_size, hidden_size)
+        self.output = nn.Linear(hidden_size, num_actions)
+
+        self.num_actions = num_actions
+
+    def forward(self, state, hidden_in, softmax_dim=-1):
+        """
+        state shape: (batch_size, sequence_length, state_dim)
+        output shape: (batch_size, sequence_length, action_dim)
+        for lstm needs to be permuted as: (sequence_length, batch_size, -1)
+        """
+        state = state.permute(1, 0, 2)
+        x = F.tanh(self.linear1(state))
+        x = F.tanh(self.linear2(x))
+        # x = F.tanh(self.linear3(x))
+        # x = F.tanh(self.linear4(x))
+        x, lstm_hidden = self.lstm1(x, hidden_in)
+        x = F.tanh(self.linear3(x))
+
+        x = x.permute(1, 0, 2)  # permute back
+
+        probs = F.softmax(self.output(x), dim=softmax_dim)
+
+        return probs, lstm_hidden
+
+    def evaluate(self, state, hidden_in, epsilon=1e-8):
+        """
+        generate sampled action with state as input wrt the policy network;
+        """
+        probs, hidden_out = self.forward(state, hidden_in, softmax_dim=-1)
+        log_probs = torch.log(probs)
+
+        # Avoid numerical instability. Ref: https://github.com/ku2482/sac-discrete.pytorch/blob/40c9d246621e658750e0a03001325006da57f2d4/sacd/model.py#L98
+        z = (probs == 0.0).float() * epsilon
+        log_probs = torch.log(probs + z)
+
+        return log_probs, hidden_out
+
+    def get_action(self, state, hidden_in, deterministic):
+        state = (
+            torch.FloatTensor(state).unsqueeze(0).unsqueeze(0).to(device)
+        )  # TODO maybe need to adjust unsqueeze here
+        probs, hidden_out = self.forward(state, hidden_in)
+        dist = Categorical(probs)
+
+        if deterministic:
+            action = np.argmax(probs.detach().cpu().numpy())
+        else:
+            action = dist.sample().squeeze().detach().cpu().numpy()
+        return action, hidden_out
+
+
 class SAC_Trainer:
     def __init__(self, replay_buffer, hidden_dim):
         self.replay_buffer = replay_buffer
 
-        self.soft_q_net1 = SoftQNetwork(state_dim, action_dim, hidden_dim).to(device)
-        self.soft_q_net2 = SoftQNetwork(state_dim, action_dim, hidden_dim).to(device)
-        self.target_soft_q_net1 = SoftQNetwork(state_dim, action_dim, hidden_dim).to(
+        self.soft_q_net1 = SoftQNetworkLSTM(state_dim, action_dim, hidden_dim).to(
             device
         )
-        self.target_soft_q_net2 = SoftQNetwork(state_dim, action_dim, hidden_dim).to(
+        self.soft_q_net2 = SoftQNetworkLSTM(state_dim, action_dim, hidden_dim).to(
             device
         )
-        self.policy_net = PolicyNetwork(state_dim, action_dim, hidden_dim).to(device)
+        self.target_soft_q_net1 = SoftQNetworkLSTM(
+            state_dim, action_dim, hidden_dim
+        ).to(device)
+        self.target_soft_q_net2 = SoftQNetworkLSTM(
+            state_dim, action_dim, hidden_dim
+        ).to(device)
+        self.policy_net = PolicyNetworkLSTM(state_dim, action_dim, hidden_dim).to(
+            device
+        )
         self.log_alpha = torch.zeros(
             1, dtype=torch.float32, requires_grad=True, device=device
         )
@@ -194,24 +376,34 @@ class SAC_Trainer:
         gamma=0.99,
         soft_tau=1e-2,
     ):
-        state, action, reward, next_state, done = self.replay_buffer.sample(batch_size)
+        hidden_in, hidden_out, state, action, last_action, reward, next_state, done = (
+            self.replay_buffer.sample(batch_size)
+        )
         # print('sample:', state, action,  reward, done)
 
-        state = torch.FloatTensor(state).to(device)
-        next_state = torch.FloatTensor(next_state).to(device)
-        action = torch.Tensor(action).to(torch.int64).to(device)
+        # action = torch.Tensor(action).to(torch.int64).to(device)
+        action = ints_to_tensor(action).to(device)
+        # print(action.shape)
+        # state = torch.FloatTensor(state).to(device)
+        state = floats_to_tensor(state).to(device)
+        # next_state = torch.FloatTensor(next_state).to(device)
+        next_state = floats_to_tensor(next_state).to(device)
+        # reward = ( torch.FloatTensor(reward).unsqueeze(1).to(device))  # reward is single value, unsqueeze() to add one dim to be [reward] at the sample dim;
         reward = (
-            torch.FloatTensor(reward).unsqueeze(1).to(device)
+            floats_to_tensor(reward).unsqueeze(-1).to(device)
         )  # reward is single value, unsqueeze() to add one dim to be [reward] at the sample dim;
-        done = torch.FloatTensor(np.float32(done)).unsqueeze(1).to(device)
-        predicted_q_value1 = self.soft_q_net1(state)
+        # done = torch.FloatTensor(np.float32(done)).unsqueeze(1).to(device)
+        done = floats_to_tensor(done, pad_value=1.0).unsqueeze(-1).to(device)
+        predicted_q_value1, _ = self.soft_q_net1(state, hidden_in)
         predicted_q_value1 = predicted_q_value1.gather(1, action.unsqueeze(-1))
-        predicted_q_value2 = self.soft_q_net2(state)
+        predicted_q_value2, _ = self.soft_q_net2(state, hidden_in)
         predicted_q_value2 = predicted_q_value2.gather(1, action.unsqueeze(-1))
-        log_prob = self.policy_net.evaluate(state)
+        log_prob, _ = self.policy_net.evaluate(state, hidden_in)
         with torch.no_grad():
-            next_log_prob = self.policy_net.evaluate(next_state)
-        # reward = reward_scale * (reward - reward.mean(dim=0)) / (reward.std(dim=0) + 1e-6) # normalize with batch mean and std; plus a small number to prevent numerical problem
+            next_log_prob, _ = self.policy_net.evaluate(next_state, hidden_out)
+        # reward = (
+        # reward_scale * (reward - reward.mean(dim=0)) / (reward.std(dim=0) + 1e-6)
+        # )  # normalize with batch mean and std; plus a small number to prevent numerical problem
 
         # Training Q Function
         self.alpha = self.log_alpha.exp()
@@ -220,8 +412,8 @@ class SAC_Trainer:
                 next_log_prob.exp()
                 * (
                     torch.min(
-                        self.target_soft_q_net1(next_state),
-                        self.target_soft_q_net2(next_state),
+                        self.target_soft_q_net1(next_state, hidden_out)[0],
+                        self.target_soft_q_net2(next_state, hidden_out)[0],
                     )
                     - self.alpha * next_log_prob
                 )
@@ -249,15 +441,14 @@ class SAC_Trainer:
         # Training Policy Function
         with torch.no_grad():
             predicted_new_q_value = torch.min(
-                self.soft_q_net1(state), self.soft_q_net2(state)
+                self.soft_q_net1(state, hidden_in)[0],
+                self.soft_q_net2(state, hidden_in)[0],
             )
         policy_loss = (
             (log_prob.exp() * (self.alpha * log_prob - predicted_new_q_value))
             .sum(dim=-1)
             .mean()
         )
-
-        print(policy_loss.shape)
 
         self.policy_optimizer.zero_grad()
         policy_loss.backward()
@@ -318,23 +509,28 @@ def plot(rewards):
 
 
 replay_buffer_size = 1e6
-replay_buffer = ReplayBuffer(replay_buffer_size)
+# replay_buffer = ReplayBuffer(replay_buffer_size)
+replay_buffer = ReplayBufferLSTM2(replay_buffer_size)
 
 # choose env
 env = gym.make("CartPole-v1")
+# env = gym.make("MountainCar-v0")
 
 state_dim = env.observation_space.shape[0]
 action_dim = env.action_space.n  # discrete
 
 # hyper-parameters for RL training
 max_episodes = 10000
-max_steps = 200
+# max_steps = 250
+max_steps = 300
 frame_idx = 0
+# batch_size = 2
 batch_size = 256
+# batch_size = 25
 update_itr = 1
 AUTO_ENTROPY = True
 DETERMINISTIC = False
-hidden_dim = 64
+hidden_dim = 512
 rewards = []
 model_path = "./model/sac_discrete_v2"
 target_entropy = -1.0 * action_dim
@@ -347,26 +543,49 @@ if __name__ == "__main__":
         # training loop
         for eps in range(max_episodes):
             state = env.reset()
-            episode_reward = 0
+            # episode_reward = 0
+
+            last_action = env.action_space.sample()
+            episode_state = []
+            episode_action = []
+            episode_last_action = []
+            episode_reward = []
+            episode_next_state = []
+            episode_done = []
+            hidden_out = (
+                torch.zeros([1, 1, hidden_dim], dtype=torch.float, device=device),
+                torch.zeros([1, 1, hidden_dim], dtype=torch.float, device=device),
+            )  # initialize hidden state for lstm, (hidden, cell), each is (layer, batch, dim)
 
             for step in range(max_steps):
-                action = sac_trainer.policy_net.get_action(
-                    state, deterministic=DETERMINISTIC
+                hidden_in = hidden_out
+                action, hidden_out = sac_trainer.policy_net.get_action(
+                    state, hidden_in, deterministic=DETERMINISTIC
                 )
                 next_state, reward, done, _ = env.step(action)
                 # env.render()
 
-                replay_buffer.push(state, action, reward, next_state, done)
+                # replay_buffer.push(state, action, reward, next_state, done)
+                if step == 0:
+                    ini_hidden_in = hidden_in
+                    ini_hidden_out = hidden_out
+                episode_state.append(state)
+                episode_action.append(action.item())
+                episode_last_action.append(last_action)
+                episode_reward.append(reward)
+                episode_next_state.append(next_state)
+                episode_done.append(done)
 
                 state = next_state
-                episode_reward += reward
+                # episode_reward += reward
+                last_action = action
                 frame_idx += 1
 
                 if len(replay_buffer) > batch_size:
                     for i in range(update_itr):
                         _ = sac_trainer.update(
                             batch_size,
-                            reward_scale=1.0,
+                            reward_scale=10.0,
                             auto_entropy=AUTO_ENTROPY,
                             target_entropy=target_entropy,
                         )
@@ -374,15 +593,26 @@ if __name__ == "__main__":
                 if done:
                     break
 
-            if eps % 20 == 0 and eps > 0:  # plot and model saving interval
-                plot(rewards)
-                np.save("rewards", rewards)
-                sac_trainer.save_model(model_path)
+            replay_buffer.push(
+                ini_hidden_in,
+                ini_hidden_out,
+                episode_state,
+                episode_action,
+                episode_last_action,
+                episode_reward,
+                episode_next_state,
+                episode_done,
+            )
+
+            # if eps % 20 == 0 and eps > 0:  # plot and model saving interval
+            # plot(rewards)
+            # np.save("rewards", rewards)
+            # sac_trainer.save_model(model_path)
             print(
                 "Episode: ",
                 eps,
                 "| Episode Reward: ",
-                episode_reward,
+                np.sum(episode_reward),
                 "| Episode Length: ",
                 step,
             )
