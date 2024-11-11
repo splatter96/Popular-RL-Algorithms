@@ -21,7 +21,6 @@ import matplotlib.pyplot as plt
 import argparse
 
 # from common.buffers import *
-from foldedtensor import as_folded_tensor
 
 GPU = True
 device_idx = 0
@@ -637,21 +636,21 @@ class SAC_Trainer:
             # print("q loss: ", q_value_loss1.item(), q_value_loss2.item())
             # print("policy loss: ", policy_loss.item())
 
-            # Soft update the target value net
-            for target_param, param in zip(
-                self.target_soft_q_net1.parameters(), self.soft_q_net1.parameters()
-            ):
-                target_param.data.copy_(  # copy data value into target parameters
-                    target_param.data * (1.0 - soft_tau) + param.data * soft_tau
-                )
-            for target_param, param in zip(
-                self.target_soft_q_net2.parameters(), self.soft_q_net2.parameters()
-            ):
-                target_param.data.copy_(  # copy data value into target parameters
-                    target_param.data * (1.0 - soft_tau) + param.data * soft_tau
-                )
+        # Soft update the target value net
+        for target_param, param in zip(
+            self.target_soft_q_net1.parameters(), self.soft_q_net1.parameters()
+        ):
+            target_param.data.copy_(  # copy data value into target parameters
+                target_param.data * (1.0 - soft_tau) + param.data * soft_tau
+            )
+        for target_param, param in zip(
+            self.target_soft_q_net2.parameters(), self.soft_q_net2.parameters()
+        ):
+            target_param.data.copy_(  # copy data value into target parameters
+                target_param.data * (1.0 - soft_tau) + param.data * soft_tau
+            )
 
-            # return predicted_new_q_value.mean()
+        # return predicted_new_q_value.mean()
 
     def save_model(self, path):
         torch.save(self.soft_q_net1.state_dict(), path + "_q1")
@@ -672,7 +671,7 @@ def plot(rewards):
     clear_output(True)
     plt.figure(figsize=(20, 5))
     plt.plot(rewards)
-    plt.savefig("sac_v2.png")
+    plt.savefig("sac_v2_discrete_lstm.png")
     # plt.show()
 
 
@@ -685,7 +684,7 @@ env = gym.make("CartPole-v1")
 # env = gym.make("MountainCar-v0")
 
 # POMDP
-# env = POMDP_wrapper(env)
+env = POMDP_wrapper(env)
 
 state_dim = env.observation_space.shape[0]
 action_dim = env.action_space.n  # discrete
@@ -693,7 +692,7 @@ action_dim = env.action_space.n  # discrete
 # hyper-parameters for RL training
 max_episodes = 10000
 # max_steps = 250
-max_steps = 300
+max_steps = 500
 frame_idx = 0
 batch_size = 16
 # batch_size = 256
@@ -704,7 +703,7 @@ DETERMINISTIC = False
 # hidden_dim = 512
 hidden_dim = 256
 rewards = []
-model_path = "./model/sac_discrete_v2"
+model_path = "./model/sac_discrete_lstm"
 target_entropy = -1.0 * action_dim
 # target_entropy = 0.98 * -np.log(1 / action_dim)
 
@@ -779,10 +778,10 @@ if __name__ == "__main__":
                 episode_done,
             )
 
-            # if eps % 20 == 0 and eps > 0:  # plot and model saving interval
-            # plot(rewards)
-            # np.save("rewards", rewards)
-            # sac_trainer.save_model(model_path)
+            if eps % 20 == 0 and eps > 0:  # plot and model saving interval
+                plot(rewards)
+                np.save("rewards", rewards)
+                sac_trainer.save_model(model_path)
             print(
                 "Episode: ",
                 eps,
@@ -791,7 +790,9 @@ if __name__ == "__main__":
                 "| Episode Length: ",
                 step,
             )
-            rewards.append(episode_reward)
+            #rewards.append(episode_reward)
+            rewards.append(np.sum(episode_reward))
+
         sac_trainer.save_model(model_path)
 
     if args.test:
@@ -800,12 +801,21 @@ if __name__ == "__main__":
             state = env.reset()
             episode_reward = 0
 
+            hidden_out = (
+                torch.zeros([1, hidden_dim], dtype=torch.float, device=device),
+                torch.zeros([1, hidden_dim], dtype=torch.float, device=device),
+            ) 
+
             for step in range(max_steps):
-                action = sac_trainer.policy_net.get_action(
-                    state, deterministic=DETERMINISTIC
+                hidden_in = hidden_out
+                action, hidden_out= sac_trainer.policy_net.get_action(
+                    state, hidden_in, deterministic=DETERMINISTIC
                 )
                 next_state, reward, done, _ = env.step(action)
                 env.render()
+
+                if done:
+                    break
 
                 episode_reward += reward
                 state = next_state
