@@ -1,0 +1,834 @@
+"""
+Soft Actor-Critic version 2
+using target Q instead of V net: 2 Q net, 2 target Q net, 1 policy net
+add alpha loss compared with version 1
+paper: https://arxiv.org/pdf/1812.05905.pdf
+
+Discrete version reference:
+https://towardsdatascience.com/adapting-soft-actor-critic-for-discrete-action-spaces-a20614d4a50a
+"""
+
+import random
+import gym
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.distributions import Categorical
+from IPython.display import clear_output
+import matplotlib.pyplot as plt
+import argparse
+from torch.nn.utils.rnn import pad_sequence
+
+# from common.buffers import *
+# from foldedtensor import as_folded_tensor
+
+GPU = True
+device_idx = 0
+if GPU:
+    device = torch.device(
+        "cuda:" + str(device_idx) if torch.cuda.is_available() else "cpu"
+    )
+else:
+    device = torch.device("cpu")
+print(device)
+
+
+parser = argparse.ArgumentParser(
+    description="Train or test neural net motor controller."
+)
+parser.add_argument("--train", dest="train", action="store_true", default=False)
+parser.add_argument("--test", dest="test", action="store_true", default=False)
+
+args = parser.parse_args()
+
+
+class POMDP_wrapper(gym.ObservationWrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        # high = np.array(
+        #     [
+        #         4.8,
+        #         0.42,
+        #     ],
+        #     dtype=np.float32,
+        # )
+        # self._observation_space = gym.spaces.Box(low=-high, high=high, dtype=np.float32)
+        #
+
+    def observation(self, observation):
+        observation[[1, 3]] = 0.0
+        return observation
+
+
+def ints_to_tensor(ints):
+    """
+    Converts a nested list of integers to a padded tensor.
+    """
+    if isinstance(ints, torch.Tensor):
+        return ints
+    if isinstance(ints, list):
+        if isinstance(ints[0], (int, bool)):
+            return torch.LongTensor(ints)
+        if isinstance(ints[0], torch.Tensor):
+            return pad_tensors(ints)
+        if isinstance(ints[0], list):
+            return ints_to_tensor([ints_to_tensor(inti) for inti in ints])
+
+
+def floats_to_tensor(floats, pad_value=0):
+    """
+    Converts a nested list of floats to a padded tensor.
+    """
+    if isinstance(floats, torch.Tensor):
+        return floats
+    if isinstance(floats, list):
+        if isinstance(floats[0], (float, np.ndarray, bool)):
+            return torch.FloatTensor(floats)
+        if isinstance(floats[0], torch.Tensor):
+            return pad_tensors(floats, pad_value)
+        if isinstance(floats[0], list):
+            return floats_to_tensor(
+                [floats_to_tensor(floati, pad_value) for floati in floats], pad_value
+            )
+
+
+def bools_to_tensor(bools):
+    """
+    Converts a nested list of bools to a padded tensor.
+    """
+    if isinstance(bools, torch.Tensor):
+        return bools
+    if isinstance(bools, list):
+        print(type(bools[0]))
+        if isinstance(bools[0], (bool, np.ndarray)):
+            return torch.BoolTensor(bools)
+        if isinstance(bools[0], torch.Tensor):
+            return pad_tensors(bools)
+        if isinstance(bools[0], list):
+            return bools_to_tensor([bools_to_tensor(booli) for booli in bools])
+
+
+def pad_tensors(tensors, pad_value=1):
+    """
+    Takes a list of `N` M-dimensional tensors (M<4) and returns a padded tensor.
+
+    The padded tensor is `M+1` dimensional with size `N, S1, S2, ..., SM`
+    where `Si` is the maximum value of dimension `i` amongst all tensors.
+    """
+    rep = tensors[0]
+    padded_dim = []
+    for dim in range(rep.dim()):
+        max_dim = max([tensor.size(dim) for tensor in tensors])
+        padded_dim.append(max_dim)
+    padded_dim = [len(tensors)] + padded_dim
+    padded_tensor = torch.ones(padded_dim) * pad_value
+    padded_tensor = padded_tensor.type_as(rep)
+    for i, tensor in enumerate(tensors):
+        size = list(tensor.size())
+        if len(size) == 1:
+            padded_tensor[i, : size[0]] = tensor
+        elif len(size) == 2:
+            padded_tensor[i, : size[0], : size[1]] = tensor
+        elif len(size) == 3:
+            padded_tensor[i, : size[0], : size[1], : size[2]] = tensor
+        else:
+            raise ValueError("Padding is supported for upto 3D tensors at max.")
+    return padded_tensor
+
+
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.buffer = []
+        self.position = 0
+
+    def push(self, state, action, reward, next_state, done):
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(None)
+        self.buffer[self.position] = (state, action, reward, next_state, done)
+        self.position = int((self.position + 1) % self.capacity)  # as a ring buffer
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        state, action, reward, next_state, done = map(
+            np.stack, zip(*batch)
+        )  # stack for each element
+        """ 
+        the * serves as unpack: sum(a,b) <=> batch=(a,b), sum(*batch) ;
+        zip: a=[1,2], b=[2,3], zip(a,b) => [(1, 2), (2, 3)] ;
+        the map serves as mapping the function on each list element: map(square, [2,3]) => [4,9] ;
+        np.stack((1,2)) => array([1, 2])
+        """
+        return state, action, reward, next_state, done
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+class SoftQNetworkLSTM(nn.Module):
+    def __init__(self, num_inputs, num_actions, hidden_size, init_w=3e-3):
+        super(SoftQNetworkLSTM, self).__init__()
+
+        self.linear1 = nn.Linear(num_inputs, hidden_size)
+        self.linear2 = nn.Linear(hidden_size, hidden_size)
+        self.lstm1 = nn.LSTM(hidden_size, hidden_size)
+        self.linear4 = nn.Linear(hidden_size, num_actions)
+
+        self.linear4.weight.data.uniform_(-init_w, init_w)
+        self.linear4.bias.data.uniform_(-init_w, init_w)
+
+    def forward(self, state, hidden_in):
+        """
+        state shape: (batch_size, sequence_length, state_dim)
+        output shape: (batch_size, sequence_length, 1)
+        for lstm needs to be permuted as: (sequence_length, batch_size, state_dim)
+        """
+
+        # print(state.shape)
+
+        x = F.tanh(self.linear1(state))
+        x, lstm_hidden = self.lstm1(x, hidden_in)  # no activation after lstm
+        x = F.tanh(self.linear2(x))
+        # x = F.tanh(self.linear3(x))
+        x = self.linear4(x)
+        # x = x.permute(1, 0, 2)
+        return x, lstm_hidden
+
+
+class PolicyNetworkLSTM(nn.Module):
+    def __init__(
+        self,
+        num_inputs,
+        num_actions,
+        hidden_size,
+        init_w=3e-3,
+        log_std_min=-20,
+        log_std_max=2,
+    ):
+        super(PolicyNetworkLSTM, self).__init__()
+
+        self.linear1 = nn.Linear(num_inputs, hidden_size)
+        self.linear2 = nn.Linear(hidden_size, hidden_size)
+        self.linear3 = nn.Linear(hidden_size, hidden_size)
+        # self.linear4 = nn.Linear(hidden_size, hidden_size)
+
+        self.lstm1 = nn.LSTM(hidden_size, hidden_size)
+        self.output = nn.Linear(hidden_size, num_actions)
+
+        self.num_actions = num_actions
+
+    def forward(self, state, hidden_in, softmax_dim=-1):
+        """
+        state shape: (batch_size, sequence_length, state_dim)
+        output shape: (batch_size, sequence_length, action_dim)
+        for lstm needs to be permuted as: (sequence_length, batch_size, -1)
+        """
+        x = F.tanh(self.linear1(state))
+        x = F.tanh(self.linear2(x))
+        x, lstm_hidden = self.lstm1(x, hidden_in)
+        x = F.tanh(self.linear3(x))
+
+        probs = F.softmax(self.output(x), dim=softmax_dim)
+
+        return probs, lstm_hidden
+
+    def evaluate(self, state, hidden_in, epsilon=1e-8):
+        """
+        generate sampled action with state as input wrt the policy network;
+        """
+        probs, hidden_out = self.forward(state, hidden_in, softmax_dim=-1)
+        log_probs = torch.log(probs)
+
+        # Avoid numerical instability. Ref: https://github.com/ku2482/sac-discrete.pytorch/blob/40c9d246621e658750e0a03001325006da57f2d4/sacd/model.py#L98
+        z = (probs == 0.0).float() * epsilon
+        log_probs = torch.log(probs + z)
+
+        return log_probs, hidden_out
+
+    def get_action(self, state, hidden_in, deterministic):
+        state = (
+            # torch.FloatTensor(state).unsqueeze(0).unsqueeze(0).to(device)
+            # torch.FloatTensor(state).unsqueeze(0).to(device)
+            torch.FloatTensor(state).unsqueeze(0).unsqueeze(0).to(device)
+        )  # TODO maybe need to adjust unsqueeze here
+        probs, hidden_out = self.forward(state, hidden_in)
+        dist = Categorical(probs)
+
+        if deterministic:
+            action = np.argmax(probs.detach().cpu().numpy())
+        else:
+            action = dist.sample().squeeze().detach().cpu().numpy()
+        return action, hidden_out
+
+
+class ReplayBufferLSTM2:
+    """
+    Replay buffer for agent with LSTM network additionally storing previous action,
+    initial input hidden state and output hidden state of LSTM.
+    And each sample contains the whole episode instead of a single step.
+    'hidden_in' and 'hidden_out' are only the initial hidden state for each episode, for LSTM initialization.
+
+    """
+
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.buffer = []
+        self.position = 0
+
+    def push(
+        self,
+        hidden_in,
+        hidden_out,
+        state,
+        action,
+        last_action,
+        reward,
+        next_state,
+        done,
+    ):
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(None)
+        self.buffer[self.position] = (
+            hidden_in,
+            hidden_out,
+            state,
+            action,
+            last_action,
+            reward,
+            next_state,
+            done,
+        )
+        self.position = int((self.position + 1) % self.capacity)  # as a ring buffer
+
+    def sample(self, batch_size):
+        (
+            s_lst,
+            a_lst,
+            la_lst,
+            r_lst,
+            ns_lst,
+            hi_lst,
+            ci_lst,
+            ho_lst,
+            co_lst,
+            d_lst,
+            mask_lst,
+        ) = (
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
+        hidden_in, hidden_out = [], []
+        batch = random.sample(self.buffer, batch_size)
+        for sample in batch:
+            (
+                (h_in, c_in),
+                (h_out, c_out),
+                state,
+                action,
+                last_action,
+                reward,
+                next_state,
+                done,
+            ) = sample
+            # print(state.shape)
+            s_lst.append(state)
+            a_lst.append(action)
+            la_lst.append(last_action)
+            r_lst.append(reward)
+            ns_lst.append(next_state)
+            d_lst.append(done)
+            mask_lst.append(torch.ones_like(reward))
+            hi_lst.append(h_in)  # h_in: (1, batch_size=1, hidden_size)
+            ci_lst.append(c_in)
+            ho_lst.append(h_out)
+            co_lst.append(c_out)
+            # hidden_in.append((h_in, c_in))
+            # hidden_out.append((h_out, c_out))
+
+        hi_lst = torch.cat(hi_lst, dim=-2).detach()  # cat along the batch dim
+        ho_lst = torch.cat(ho_lst, dim=-2).detach()
+        ci_lst = torch.cat(ci_lst, dim=-2).detach()
+        co_lst = torch.cat(co_lst, dim=-2).detach()
+
+        hidden_in = (hi_lst, ci_lst)
+        hidden_out = (ho_lst, co_lst)
+
+        # create batches of equal length
+        s = pad_sequence(s_lst)
+        a = pad_sequence(a_lst)
+        la = pad_sequence(la_lst)
+        r = pad_sequence(r_lst)
+        ns = pad_sequence(ns_lst)
+        d = pad_sequence(d_lst)
+        mask = pad_sequence(mask_lst)
+        # print(f"state {s.shape}")
+        # print(f"hi {hi_lst.shape}")
+        # print(mask.shape)
+        # print(mask)
+        # print(r)
+
+        # return hidden_in, hidden_out, s_lst, a_lst, la_lst, r_lst, ns_lst, d_lst
+        return hidden_in, hidden_out, s, a, la, r, ns, d, mask
+
+    def __len__(
+        self,
+    ):  # cannot work in multiprocessing case, len(replay_buffer) is not available in proxy of manager!
+        return len(self.buffer)
+
+    def get_length(self):
+        return len(self.buffer)
+
+
+class SAC_Trainer:
+    def __init__(self, replay_buffer, hidden_dim):
+        self.replay_buffer = replay_buffer
+
+        self.soft_q_net1 = SoftQNetworkLSTM(state_dim, action_dim, hidden_dim).to(
+            device
+        )
+        self.soft_q_net2 = SoftQNetworkLSTM(state_dim, action_dim, hidden_dim).to(
+            device
+        )
+        self.target_soft_q_net1 = SoftQNetworkLSTM(
+            state_dim, action_dim, hidden_dim
+        ).to(device)
+        self.target_soft_q_net2 = SoftQNetworkLSTM(
+            state_dim, action_dim, hidden_dim
+        ).to(device)
+        self.policy_net = PolicyNetworkLSTM(state_dim, action_dim, hidden_dim).to(
+            device
+        )
+        self.log_alpha = torch.zeros(
+            1, dtype=torch.float32, requires_grad=True, device=device
+        )
+        print("Soft Q Network (1,2): ", self.soft_q_net1)
+        print("Policy Network: ", self.policy_net)
+
+        for target_param, param in zip(
+            self.target_soft_q_net1.parameters(), self.soft_q_net1.parameters()
+        ):
+            target_param.data.copy_(param.data)
+        for target_param, param in zip(
+            self.target_soft_q_net2.parameters(), self.soft_q_net2.parameters()
+        ):
+            target_param.data.copy_(param.data)
+
+        self.soft_q_criterion1 = nn.MSELoss(reduction="none")
+        self.soft_q_criterion2 = nn.MSELoss(reduction="none")
+
+        soft_q_lr = 3e-4
+        policy_lr = 3e-4
+        alpha_lr = 3e-4
+
+        self.soft_q_optimizer1 = optim.Adam(self.soft_q_net1.parameters(), lr=soft_q_lr)
+        self.soft_q_optimizer2 = optim.Adam(self.soft_q_net2.parameters(), lr=soft_q_lr)
+        self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr=policy_lr)
+        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=alpha_lr)
+
+    def update(
+        self,
+        batch_size,
+        reward_scale=10.0,
+        auto_entropy=True,
+        target_entropy=-2,
+        gamma=0.99,
+        soft_tau=1e-2,
+    ):
+        # batch = self.replay_buffer.sample(batch_size)
+        (
+            hidden_in,
+            hidden_out,
+            state,
+            action,
+            last_action,
+            reward,
+            next_state,
+            done,
+            mask,
+        ) = self.replay_buffer.sample(batch_size)
+
+        # print(len(state_lst))
+        # state = np.array(state_lst[0])
+        # print(state_lst.shape)
+        # # print(state_lst)
+        # exit(0)
+
+        # for i in range(batch_size):
+        # (
+        #     hidden_in,
+        #     hidden_out,
+        #     state,
+        #     action,
+        #     last_action,
+        #     reward,
+        #     next_state,
+        #     done,
+        # ) = (
+        #     hidden_in_lst[i],
+        #     hidden_out_lst[i],
+        #     state_lst[i],
+        #     action_lst[i],
+        #     last_action_lst[i],
+        #     reward_lst[i],
+        #     next_state_lst[i],
+        #     done_lst[i],
+        # )
+        #
+        action = action.to(torch.int64).to(device)
+        # state = torch.FloatTensor(state).to(device)
+        # next_state = torch.FloatTensor(next_state).to(device)
+        reward = (
+            # torch.FloatTensor(reward).unsqueeze(-1).to(device)
+            reward.unsqueeze(-1).to(device)
+        )  # reward is single value, unsqueeze() to add one dim to be [reward] at the sample dim;
+        # done = torch.FloatTensor(np.float32(done)).unsqueeze(-1).to(device)
+        done = done.unsqueeze(-1).to(device)
+        mask = mask.unsqueeze(-1).to(device)
+
+        # convert mask from float to bool
+        # mask = mask > 1e-8
+        #
+        # print(hidden_in[0].shape)
+        # print(reward.shape)
+        # print(mask)
+        # print(mask.shape)
+        #
+        predicted_q_value1, _ = self.soft_q_net1(state, hidden_in)
+        predicted_q_value1 = predicted_q_value1.gather(-1, action.unsqueeze(-1))
+        predicted_q_value2, _ = self.soft_q_net2(state, hidden_in)
+        predicted_q_value2 = predicted_q_value2.gather(-1, action.unsqueeze(-1))
+        log_prob, _ = self.policy_net.evaluate(state, hidden_in)
+        with torch.no_grad():
+            next_log_prob, _ = self.policy_net.evaluate(next_state, hidden_out)
+        # reward = (
+        # reward_scale * (reward - reward.mean(dim=0)) / (reward.std(dim=0) + 1e-6)
+        # )  # normalize with batch mean and std; plus a small number to prevent numerical problem
+
+        # Training Q Function
+        self.alpha = self.log_alpha.exp()
+        target_q_min = (
+            (
+                next_log_prob.exp()
+                * (
+                    torch.min(
+                        self.target_soft_q_net1(next_state, hidden_out)[0],
+                        self.target_soft_q_net2(next_state, hidden_out)[0],
+                    )
+                    - self.alpha * next_log_prob
+                )
+            )
+            .sum(dim=-1)
+            .unsqueeze(-1)
+        )
+
+        target_q_value = (
+            reward + (1 - done) * gamma * target_q_min
+        )  # if done==1, only reward
+
+        # print(predicted_q_value1.shape)
+        # print(target_q_value.shape)
+        #
+        predicted_q_value1 = predicted_q_value1 * mask
+        predicted_q_value2 = predicted_q_value2 * mask
+        target_q_value = target_q_value * mask
+
+        q_value_loss1 = (
+            (predicted_q_value1 - target_q_value.detach()) ** 2
+        ).sum() / mask.sum()
+        q_value_loss2 = (
+            (predicted_q_value2 - target_q_value.detach()) ** 2
+        ).sum() / mask.sum()
+
+        # q_value_loss1 = self.soft_q_criterion1(
+        #     predicted_q_value1, target_q_value.detach()
+        # )
+        # # detach: no gradients for the variable
+        # q_value_loss2 = self.soft_q_criterion2(
+        #     predicted_q_value2, target_q_value.detach()
+        # )
+
+        # q_value_loss1 = (q_value_loss1 * mask).sum()
+        # q_value_loss1 = q_value_loss1 / mask.sum()
+        #
+        # q_value_loss2 = (q_value_loss2 * mask).sum()
+        # q_value_loss2 = q_value_loss2 / mask.sum()
+
+        self.soft_q_optimizer1.zero_grad()
+        q_value_loss1.backward()
+        self.soft_q_optimizer1.step()
+        self.soft_q_optimizer2.zero_grad()
+        q_value_loss2.backward()
+        self.soft_q_optimizer2.step()
+
+        # Training Policy Function
+        with torch.no_grad():
+            predicted_new_q_value = torch.min(
+                self.soft_q_net1(state, hidden_in)[0],
+                self.soft_q_net2(state, hidden_in)[0],
+            )
+
+        # print(mask.shape)
+        # print(mask.repeat(1, 1, 2).shape)
+        # print(log_prob.shape)
+        # print(predicted_new_q_value.shape)
+
+        # TODO make generalizable for num_actions instead of 2
+        # mask2 = mask.repeat(1, 1, 2)
+        # policy_loss_old = (
+        #     (
+        #         log_prob[mask2].exp()
+        #         * (self.alpha * log_prob[mask2] - predicted_new_q_value[mask2])
+        #     )
+        #     .sum(dim=-1)
+        #     .mean()
+        # )
+        # policy_loss = (
+        #     (log_prob.exp() * (self.alpha * log_prob - predicted_new_q_value)).sum(
+        #         dim=-1
+        #     )
+        #     # .mean()
+        # )
+        policy_loss = (
+            log_prob.exp() * (self.alpha * log_prob - predicted_new_q_value)
+            # ).sum(dim=-1)
+        ).sum(dim=-1, keepdims=True)
+
+        # print(policy_loss.shape)
+        #
+        # print(policy_loss.shape)
+        # print(mask.shape)
+        # print(mask.sum())
+        # print(mask.squeeze(-1).sum())
+        # policy_loss = (policy_loss * mask.squeeze(-1)).sum()
+        policy_loss = (policy_loss * mask).sum()
+        policy_loss = policy_loss / mask.sum()
+
+        # policy_loss_test1 = (
+        #     log_prob.exp() * (self.alpha * log_prob - predicted_new_q_value)
+        # ).mean()
+        # policy_loss_test2 = (
+        #     (log_prob.exp() * (self.alpha * log_prob - predicted_new_q_value))
+        #     .sum(dim=-1)
+        #     .mean()
+        # )
+        # print(policy_loss_test1)
+        # print(policy_loss_test2)
+        # print((log_prob.exp() * (self.alpha * log_prob - predicted_new_q_value)).shape)
+        # print(
+        #     (log_prob.exp() * (self.alpha * log_prob - predicted_new_q_value))
+        #     .sum(dim=-1)
+        #     .shape
+        # )
+        # # print(policy_loss_old)
+        # print(policy_loss)
+
+        self.policy_optimizer.zero_grad()
+        policy_loss.backward()
+        self.policy_optimizer.step()
+
+        # Updating alpha wrt entropy
+        # alpha = 0.0  # trade-off between exploration (max entropy) and exploitation (max Q)
+        if auto_entropy is True:
+            # alpha_loss = -(self.log_alpha * (log_prob + target_entropy).detach()).mean()
+            #
+            # print(log_prob.shape)
+            # mask = mask.repeat(1, 1, 2)
+            log_prob = log_prob.sum(dim=-1, keepdim=True)
+            log_prob = (log_prob * mask).sum() / mask.sum()
+            alpha_loss = -(self.log_alpha * (log_prob + target_entropy).detach())
+            # alpha_loss = (alpha_loss * mask).sum()
+            # alpha_loss = alpha_loss / mask.sum()
+            # print('alpha loss: ',alpha_loss)
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
+        else:
+            self.alpha = 1.0
+            alpha_loss = 0
+
+        # print("q loss: ", q_value_loss1.item(), q_value_loss2.item())
+        # print("policy loss: ", policy_loss.item())
+
+        # Soft update the target value net
+        for target_param, param in zip(
+            self.target_soft_q_net1.parameters(), self.soft_q_net1.parameters()
+        ):
+            target_param.data.copy_(  # copy data value into target parameters
+                target_param.data * (1.0 - soft_tau) + param.data * soft_tau
+            )
+        for target_param, param in zip(
+            self.target_soft_q_net2.parameters(), self.soft_q_net2.parameters()
+        ):
+            target_param.data.copy_(  # copy data value into target parameters
+                target_param.data * (1.0 - soft_tau) + param.data * soft_tau
+            )
+
+    def save_model(self, path):
+        torch.save(self.soft_q_net1.state_dict(), path + "_q1")
+        torch.save(self.soft_q_net2.state_dict(), path + "_q2")
+        torch.save(self.policy_net.state_dict(), path + "_policy")
+
+    def load_model(self, path):
+        self.soft_q_net1.load_state_dict(torch.load(path + "_q1"))
+        self.soft_q_net2.load_state_dict(torch.load(path + "_q2"))
+        self.policy_net.load_state_dict(torch.load(path + "_policy"))
+
+        self.soft_q_net1.eval()
+        self.soft_q_net2.eval()
+        self.policy_net.eval()
+
+
+def plot(rewards):
+    clear_output(True)
+    plt.figure(figsize=(20, 5))
+    plt.plot(rewards)
+    plt.savefig("sac_v2.png")
+    # plt.show()
+
+
+replay_buffer_size = 1e6
+replay_buffer = ReplayBufferLSTM2(replay_buffer_size)
+
+# choose env
+env = gym.make("CartPole-v0")
+# env = gym.make("MountainCar-v0")
+
+# POMDP
+# env = POMDP_wrapper(env)
+
+state_dim = env.observation_space.shape[0]
+action_dim = env.action_space.n  # discrete
+
+# hyper-parameters for RL training
+max_episodes = 10000
+# max_steps = 250
+max_steps = 300
+frame_idx = 0
+batch_size = 16
+# batch_size = 256
+# batch_size = 25
+update_itr = 1
+# AUTO_ENTROPY = True
+AUTO_ENTROPY = True
+DETERMINISTIC = False
+# hidden_dim = 512
+hidden_dim = 256
+rewards = []
+model_path = "./model/sac_discrete_v2"
+target_entropy = -1.0 * action_dim
+# target_entropy = 0.98 * -np.log(1 / action_dim)
+
+sac_trainer = SAC_Trainer(replay_buffer, hidden_dim=hidden_dim)
+
+if __name__ == "__main__":
+    if args.train:
+        # training loop
+        for eps in range(max_episodes):
+            state = env.reset()
+            # episode_reward = 0
+
+            last_action = env.action_space.sample()
+            episode_state = []
+            episode_action = []
+            episode_last_action = []
+            episode_reward = []
+            episode_next_state = []
+            episode_done = []
+            hidden_out = (
+                torch.zeros([1, 1, hidden_dim], dtype=torch.float, device=device),
+                torch.zeros([1, 1, hidden_dim], dtype=torch.float, device=device),
+                # torch.zeros([1, hidden_dim], dtype=torch.float, device=device),
+                # torch.zeros([1, hidden_dim], dtype=torch.float, device=device),
+            )  # initialize hidden state for lstm, (hidden, cell), each is (layer, batch, dim)
+
+            for step in range(max_steps):
+                hidden_in = hidden_out
+                action, hidden_out = sac_trainer.policy_net.get_action(
+                    state, hidden_in, deterministic=DETERMINISTIC
+                )
+                next_state, reward, done, _ = env.step(action)
+                # env.render()
+
+                # replay_buffer.push(state, action, reward, next_state, done)
+                if step == 0:
+                    ini_hidden_in = hidden_in
+                    ini_hidden_out = hidden_out
+                episode_state.append(state)
+                episode_action.append(action.item())
+                episode_last_action.append(last_action)
+                episode_reward.append(reward)
+                episode_next_state.append(next_state)
+                episode_done.append(done)
+
+                state = next_state
+                # episode_reward += reward
+                last_action = action
+                frame_idx += 1
+
+                if len(replay_buffer) > batch_size:
+                    for i in range(update_itr):
+                        # _ = sac_trainer.update(
+                        sac_trainer.update(
+                            batch_size,
+                            reward_scale=10.0,
+                            auto_entropy=AUTO_ENTROPY,
+                            target_entropy=target_entropy,
+                        )
+
+                if done:
+                    break
+
+            replay_buffer.push(
+                ini_hidden_in,
+                ini_hidden_out,
+                torch.FloatTensor(episode_state).to(device),
+                torch.FloatTensor(episode_action).to(device),
+                torch.FloatTensor(episode_last_action).to(device),
+                torch.FloatTensor(episode_reward).to(device),
+                torch.FloatTensor(episode_next_state).to(device),
+                torch.FloatTensor(episode_done).to(device),
+            )
+
+            # if eps % 20 == 0 and eps > 0:  # plot and model saving interval
+            # plot(rewards)
+            # np.save("rewards", rewards)
+            # sac_trainer.save_model(model_path)
+            print(
+                "Episode: ",
+                eps,
+                "| Episode Reward: ",
+                np.sum(episode_reward),
+                "| Episode Length: ",
+                step,
+            )
+            rewards.append(episode_reward)
+        sac_trainer.save_model(model_path)
+
+    if args.test:
+        sac_trainer.load_model(model_path)
+        for eps in range(10):
+            state = env.reset()
+            episode_reward = 0
+
+            for step in range(max_steps):
+                action = sac_trainer.policy_net.get_action(
+                    state, deterministic=DETERMINISTIC
+                )
+                next_state, reward, done, _ = env.step(action)
+                env.render()
+
+                episode_reward += reward
+                state = next_state
+
+            print("Episode: ", eps, "| Episode Reward: ", episode_reward)
